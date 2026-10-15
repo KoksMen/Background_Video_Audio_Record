@@ -146,7 +146,16 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
                 name = getString(R.string.Channel_name)
             )
 
-            startForeground(NOTIFICATION_ID, createNotification())
+            val notification = createNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                var serviceType = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    serviceType = serviceType or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                }
+                startForeground(NOTIFICATION_ID, notification, serviceType)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
             Log.i(LOG_TAG, "foreground started")
         }
     }
@@ -170,11 +179,20 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
     }
     //
 
-    //Record control
-    override fun startRecord(outputFile: File) {
-        if (recorder != null) return
-        videoRecordServiceScope.launch {
+    private var currentPrimaryFile: File? = null
+    private var currentSecondaryFile: File? = null
+    private var accumulatedDurationMs: Long = 0L
+    private var isRotating: Boolean = false
 
+    //Record control
+    override fun startRecord(outputFile: File, secondaryOutputFile: File?) {
+        if (recorder != null) return
+        currentPrimaryFile = outputFile
+        currentSecondaryFile = secondaryOutputFile
+        accumulatedDurationMs = 0L
+        isRotating = false
+
+        videoRecordServiceScope.launch {
             val config = recordVideoParams.cameraConfig.first()
 
             recorder = VideoRecorder.Builder(
@@ -185,6 +203,9 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
                 setCameraType(config.cameraType.cameraTypeForRecorder)
                 setMaxQuality(config.maxQuality.videoRecorderMaxQuality)
                 setCameraRotation(config.cameraRotation.cameraRotation)
+                if (secondaryOutputFile != null) {
+                    setSecondaryOutputFile(secondaryOutputFile)
+                }
             }.build()
 
             startRecordObserver()
@@ -196,12 +217,55 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
         }
     }
 
+    private suspend fun rotateChunk(lastChunkDuration: Long) {
+        Log.i(LOG_TAG, "Rotating video recording chunk at duration $lastChunkDuration ms")
+        accumulatedDurationMs += lastChunkDuration
+
+        stopRecordObserver(resetState = false)
+        recorder?.run {
+            stopRecordAndDestroyRecorder()
+        }
+        recorder = null
+
+        withContext(NonCancellable) {
+            recordVideoParams.saveRecordedVideoStrategy.saveRecord()
+            Log.i(LOG_TAG, "Previous chunk saved successfully")
+        }
+
+        val baseDir = currentPrimaryFile?.parentFile ?: applicationContext.cacheDir
+        val timestamp = System.currentTimeMillis()
+        val nextPrimary = File(baseDir, "REC_${timestamp}.mp4")
+        val nextSecondary = if (currentSecondaryFile != null) File(baseDir, "REC_${timestamp}_secondary.mp4") else null
+        currentPrimaryFile = nextPrimary
+        currentSecondaryFile = nextSecondary
+
+        val config = recordVideoParams.cameraConfig.first()
+        recorder = VideoRecorder.Builder(
+            applicationContext,
+            nextPrimary,
+            this@RecordVideoService
+        ).apply {
+            setCameraType(config.cameraType.cameraTypeForRecorder)
+            setMaxQuality(config.maxQuality.videoRecorderMaxQuality)
+            setCameraRotation(config.cameraRotation.cameraRotation)
+            if (nextSecondary != null) {
+                setSecondaryOutputFile(nextSecondary)
+            }
+        }.build()
+
+        startRecordObserver()
+        recorder?.run {
+            startRecord()
+        }
+        isRotating = false
+        Log.i(LOG_TAG, "Next chunk recording started")
+    }
+
     override fun pauseRecord() {
         if (recorder == null) return
         videoRecordServiceScope.launch {
             recorder?.run {
                 pauseRecord()
-
             }
             Log.i(LOG_TAG, "pauseRecord")
         }
@@ -221,12 +285,14 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
     override fun stopRecord() {
         if (recorder == null) return
         videoRecordServiceScope.launch {
-            stopRecordObserver()
+            stopRecordObserver(resetState = true)
             recorder?.run {
                 stopRecordAndDestroyRecorder()
             }
 
             recorder = null
+            accumulatedDurationMs = 0L
+            isRotating = false
 
             Log.i(LOG_TAG, "stopRecord")
 
@@ -245,13 +311,31 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
             recorder?.run {
                 recordState
                     .collect() { state ->
+                        val chunkDuration = when (state) {
+                            is RecorderState.Recording -> state.currentRecordDuration
+                            is RecorderState.Paused -> state.currentRecordDuration
+                            else -> 0L
+                        }
+                        val totalDuration = accumulatedDurationMs + chunkDuration
                         _currentState.update {
                             when (state) {
-                                is RecorderState.Recording -> RecordVideoState.Recording(state.currentRecordDuration)
-
-                                is RecorderState.Paused -> RecordVideoState.Pause(state.currentRecordDuration)
-
+                                is RecorderState.Recording -> RecordVideoState.Recording(totalDuration)
+                                is RecorderState.Paused -> RecordVideoState.Pause(totalDuration)
                                 else -> RecordVideoState.Idle
+                            }
+                        }
+
+                        // Check video chunk split limit
+                        val config = recordVideoParams.cameraConfig.first()
+                        val splitLimit = com.xxmrk888ytxx.coreandroid.models.VideoSplitLimit.fromId(config.videoSplitLimitId)
+                        val shouldRotate = splitLimit != com.xxmrk888ytxx.coreandroid.models.VideoSplitLimit.DISABLED &&
+                                chunkDuration >= splitLimit.maxDurationMs &&
+                                !isRotating
+
+                        if (shouldRotate) {
+                            isRotating = true
+                            videoRecordServiceScope.launch {
+                                rotateChunk(chunkDuration)
                             }
                         }
                     }
@@ -259,23 +343,37 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
         }
     }
 
-    private fun stopRecordObserver() {
+    private fun stopRecordObserver(resetState: Boolean = true) {
         recordStateObserverScope.coroutineContext.cancelChildren()
-        _currentState.update { RecordVideoState.Idle }
+        if (resetState) {
+            _currentState.update { RecordVideoState.Idle }
+        }
     }
     //
+
+    private fun getChannelId(iconId: Int): String = "${NOTIFICATION_CHANNEL_ID}_$iconId"
+
+    private fun ensureNotificationChannel(iconId: Int) {
+        applicationContext.buildNotificationChannel(
+            id = getChannelId(iconId),
+            name = getString(R.string.Channel_name)
+        )
+    }
 
     //Foreground notification
     private suspend fun createNotification(): Notification {
 
         val foregroundType = recordVideoParams.cameraConfig.first().foregroundNotificationType
+        val channelId = getChannelId(foregroundType.iconId)
+        ensureNotificationChannel(foregroundType.iconId)
 
         return when (foregroundType) {
             is ForegroundNotificationType.CustomNotification -> {
-                applicationContext.buildNotification(NOTIFICATION_CHANNEL_ID) {
+                applicationContext.buildNotification(channelId) {
                     setContentTitle(foregroundType.title)
                     setContentText(foregroundType.text)
-                    setSmallIcon(R.drawable.baseline_videocam_24)
+                    val iconRes = com.xxmrk888ytxx.coreandroid.models.NotificationIconType.fromId(foregroundType.iconId).iconRes
+                    com.xxmrk888ytxx.coreandroid.NotificationHelper.applyNotificationIcon(this, applicationContext, iconRes)
                     setOnlyAlertOnce(true)
                     if (foregroundType.isPauseResumeButtonActive) {
                         when (_currentState.value) {
@@ -313,7 +411,10 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
 
     private suspend fun createForegroundNotificationViewRecordStateType(recordVideoState: RecordVideoState): Notification {
         val foregroundType = recordVideoParams.cameraConfig.first().foregroundNotificationType
-        return applicationContext.buildNotification(NOTIFICATION_CHANNEL_ID) {
+        val channelId = getChannelId(foregroundType.iconId)
+        ensureNotificationChannel(foregroundType.iconId)
+
+        return applicationContext.buildNotification(channelId) {
             setContentTitle(
                 when (recordVideoState) {
                     is RecordVideoState.Recording -> getString(R.string.Video_recording_is_on)
@@ -324,7 +425,8 @@ class RecordVideoService : Service(), RecordVideoServiceController, LifecycleOwn
                 "${getString(R.string.Recording_runs)} " +
                         recordVideoState.recordDuration.milliSecondToString()
             )
-            setSmallIcon(R.drawable.baseline_videocam_24)
+            val iconRes = com.xxmrk888ytxx.coreandroid.models.NotificationIconType.fromId(foregroundType.iconId).iconRes
+            com.xxmrk888ytxx.coreandroid.NotificationHelper.applyNotificationIcon(this, applicationContext, iconRes)
             setOnlyAlertOnce(true)
             if (foregroundType.isPauseResumeButtonActive) {
                 when (_currentState.value) {
